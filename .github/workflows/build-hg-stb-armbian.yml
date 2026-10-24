@@ -269,9 +269,31 @@ jobs:
           armbian_fstype: ${{ inputs.armbian_fstype }}
           builder_name: ${{ inputs.builder_name }}
 
+      - name: Verify static IP baked into image
+        id: verify
+        if: ${{ steps.clean.outputs.status == 'success' && !cancelled() }}
+        run: |
+          # Cari file hasil rebuild target
+          IMG=$(ls build/output/images/Armbian_*${{ inputs.stb_model }}_*.img.gz 2>/dev/null | head -1)
+          [[ -z "$IMG" ]] && IMG=$(ls ${PACKAGED_OUTPUTPATH:-/tmp/nonexistent}/*.img.gz 2>/dev/null | head -1)
+          if [[ -z "$IMG" ]]; then
+            echo "::warning::File image hasil rebuild tidak ditemukan untuk diverifikasi"
+            echo "status=skipped" >> ${GITHUB_OUTPUT}
+            exit 0
+          fi
+          echo "Verifying [ $IMG ] ..."
+          if zcat "$IMG" | grep -aq "${{ inputs.static_ip%/* }}"; then
+            echo "OK: static IP ${{ inputs.static_ip }} ter-bake di dalam image"
+            echo "status=success" >> ${GITHUB_OUTPUT}
+          else
+            echo "::error::Static IP ${{ inputs.static_ip }} TIDAK ditemukan di dalam image!"
+            echo "status=failed" >> ${GITHUB_OUTPUT}
+            exit 1
+          fi
+
       - name: Upload rebuilt STB image to Release
         uses: ophub/upload-to-releases@main
-        if: ${{ env.PACKAGED_STATUS == 'success' && !cancelled() }}
+        if: ${{ env.PACKAGED_STATUS == 'success' && steps.verify.outputs.status != 'failed' && !cancelled() }}
         with:
           tag: ${{ env.build_tag }}
           artifacts: ${{ env.PACKAGED_OUTPUTPATH }}/*
@@ -293,3 +315,5 @@ jobs:
             ### Applicable Platform
             - 🐧 `arm64`
             - 📡 DTB meson: dipilih otomatis sesuai model STB
+            - ✅ Static IP diverifikasi ada di dalam image saat build
+            - Build: [run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
