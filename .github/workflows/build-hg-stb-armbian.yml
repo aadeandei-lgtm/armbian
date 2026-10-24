@@ -62,8 +62,8 @@ on:
         default: "yes"
         type: choice
         options:
-          - yes
-          - no
+          - "yes"
+          - "no"
       extra_packages:
         description: "Paket tambahan dipisah spasi (mis: git wireguard). Hanya relevan saat build_minimal=yes."
         required: false
