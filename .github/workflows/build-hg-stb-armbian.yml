@@ -56,8 +56,16 @@ on:
         options:
           - ext4
           - btrfs
+      build_minimal:
+        description: "yes = hemat ROM (buang 58 paket non-esensial). no = paket penuh (ada build-essential, git, mc, dll)."
+        required: false
+        default: "yes"
+        type: choice
+        options:
+          - yes
+          - no
       extra_packages:
-        description: "Paket tambahan dipisah spasi (mis: wireguard docker.io sqlite3). Kosongkan kalau tidak perlu."
+        description: "Paket tambahan dipisah spasi (mis: git wireguard). Hanya relevan saat build_minimal=yes."
         required: false
         default: ""
       builder_name:
@@ -160,7 +168,8 @@ jobs:
             echo "[customize] Installing extra packages: ${EXTRA}"
             apt-get install -y --no-install-recommends ${EXTRA} || true
           fi
-          apt-get clean
+          apt-get clean || true
+          rm -rf /var/lib/apt/lists/* 2>/dev/null || true
           exit 0
           EOF
           chmod +x userpatches/customize-image.sh
@@ -181,7 +190,7 @@ jobs:
 
           # Compile options reference: https://docs.armbian.com/Developer-Guide_Build-Options
           cd build/
-              ./compile.sh RELEASE=${{ inputs.set_release }} BOARD=${config_board} BRANCH=current BUILD_MINIMAL=no \
+              ./compile.sh RELEASE=${{ inputs.set_release }} BOARD=${config_board} BRANCH=current BUILD_MINIMAL=${{ inputs.build_minimal }} \
                            BUILD_ONLY=default HOST=armbian BUILD_DESKTOP=no EXPERT=yes KERNEL_CONFIGURE=no \
                            COMPRESS_OUTPUTIMAGE="sha" SHARE_LOG=yes
 
