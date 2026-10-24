@@ -68,6 +68,14 @@ on:
         description: "Paket tambahan dipisah spasi (mis: git wireguard). Hanya relevan saat build_minimal=yes."
         required: false
         default: ""
+      static_ip:
+        description: "IP statis STB (CIDR). Contoh: 192.168.4.3/24"
+        required: false
+        default: "192.168.4.4/24"
+      gateway_ip:
+        description: "Gateway / DNS STB."
+        required: false
+        default: "192.168.4.1"
       builder_name:
         description: "Set Armbian builder signature."
         required: false
@@ -156,6 +164,8 @@ jobs:
         if: ${{ steps.down.outputs.status == 'success' && !cancelled() }}
         run: |
           EXTRA="${{ inputs.extra_packages }}"
+          STATIC_IP="${{ inputs.static_ip }}"
+          GATEWAY="${{ inputs.gateway_ip }}"
           mkdir -p userpatches
           cat > userpatches/customize-image.sh <<EOF
           #!/bin/bash
@@ -163,6 +173,29 @@ jobs:
           # \$1=RELEASE \$2=LINUXFAMILY \$3=BOARD \$4=BUILD_DESKTOP \$5=VARIANT \$6=BUILD_MINIMAL
           set -e
           export DEBIAN_FRONTEND=noninteractive
+
+          # --- IP statis via netplan (persisten, DHCP dimatikan) ---
+          mkdir -p /etc/netplan
+          cat > /etc/netplan/00-static-ip.yaml <<NETPLAN
+          network:
+            version: 2
+            renderer: networkd
+            ethernets:
+              eth0:
+                dhcp4: no
+                addresses:
+                  - ${STATIC_IP}
+                routes:
+                  - to: 0.0.0.0/0
+                    via: ${GATEWAY}
+                nameservers:
+                  addresses:
+                    - 9.9.9.9
+                    - 9.9.9.10
+          NETPLAN
+          chmod 600 /etc/netplan/00-static-ip.yaml
+
+          # --- extra packages ---
           apt-get update || true
           if [ -n "${EXTRA}" ]; then
             echo "[customize] Installing extra packages: ${EXTRA}"
@@ -173,7 +206,7 @@ jobs:
           exit 0
           EOF
           chmod +x userpatches/customize-image.sh
-          echo "extra packages: [${EXTRA}]"
+          echo "extra packages: [${EXTRA}] | static ip: [${STATIC_IP}] via [${GATEWAY}]"
           echo "status=success" >> ${GITHUB_OUTPUT}
 
       - name: Compile Armbian [ ${{ inputs.set_release }} ]
@@ -251,6 +284,7 @@ jobs:
             ### Armbian Image STB HG680
             - Target: `${{ inputs.stb_model }}` (HG680P / HG680-FJ)
             - Release: `${{ inputs.set_release }}` — kernel `${{ inputs.armbian_kernel }}` (${{ inputs.kernel_usage }})
+            - Static IP: `${{ inputs.static_ip }}` via `${{ inputs.gateway_ip }}` (DHCP off)
             - Extra packages: `${{ inputs.extra_packages || '-' }}`
             - Default username: `root`
             - Default password: `1234`
