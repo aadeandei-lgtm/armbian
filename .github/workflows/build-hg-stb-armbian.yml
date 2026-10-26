@@ -67,7 +67,7 @@ on:
       extra_packages:
         description: "Paket tambahan dipisah spasi (mis: git wireguard). Hanya relevan saat build_minimal=yes."
         required: false
-        default: ""
+        default: "zram-tools"
       static_ip:
         description: "IP statis STB (CIDR). Contoh: 192.168.4.3/24"
         required: false
@@ -195,6 +195,25 @@ jobs:
           NETPLAN
           chmod 600 /etc/netplan/00-static-ip.yaml
 
+          # --- Buang netplan match-all (ditulis ekstensi networkd SETELAH file ini
+          #     disalin ke rootfs; match "e*" menang di networkd → IP statis tidak
+          #     pernah terpakai di perangkat nyata) ---
+          rm -f /etc/netplan/10-dhcp-all-interfaces.yaml /etc/netplan/10-dhcp-*.yaml
+
+          # --- zram (zramswap dari zram-tools) + ramlog aktif sejak boot ---
+          #     armbian-zram-config TIDAK di-enable agar tidak double-swap
+          #     dengan zramswap.service; keduanya pakai zramctl -f jadi aman.
+          mkdir -p /etc/systemd/system/multi-user.target.wants \
+                   /etc/systemd/system/sysinit.target.wants
+          ln -sf /lib/systemd/system/zramswap.service \
+                 /etc/systemd/system/multi-user.target.wants/
+          ln -sf /lib/systemd/system/armbian-ramlog.service \
+                 /etc/systemd/system/sysinit.target.wants/
+
+          # --- wpa_supplicant mati (STB HG tidak punya wifi) ---
+          rm -f /etc/systemd/system/multi-user.target.wants/wpa_supplicant.service \\
+                /lib/systemd/system/multi-user.target.wants/wpa_supplicant.service
+
           # --- extra packages ---
           apt-get update || true
           if [ -n "${EXTRA}" ]; then
@@ -269,7 +288,7 @@ jobs:
           armbian_fstype: ${{ inputs.armbian_fstype }}
           builder_name: ${{ inputs.builder_name }}
 
-      - name: Verify static IP baked into image
+      - name: Verify static IP & boot config baked into image
         id: verify
         if: ${{ steps.clean.outputs.status == 'success' && !cancelled() }}
         run: |
@@ -282,14 +301,80 @@ jobs:
             exit 0
           fi
           echo "Verifying [ $IMG ] ..."
-          if zcat "$IMG" | grep -aq "${{ inputs.static_ip%/* }}"; then
-            echo "OK: static IP ${{ inputs.static_ip }} ter-bake di dalam image"
-            echo "status=success" >> ${GITHUB_OUTPUT}
-          else
+
+          # --- Fallback lama: grep string mentah di dalam .img.gz ---
+          if ! zcat "$IMG" | grep -aq "${{ inputs.static_ip%/* }}"; then
             echo "::error::Static IP ${{ inputs.static_ip }} TIDAK ditemukan di dalam image!"
             echo "status=failed" >> ${GITHUB_OUTPUT}
             exit 1
           fi
+          echo "OK: static IP ${{ inputs.static_ip }} ter-bake di dalam image"
+
+          # --- Verifikasi mendalam: mount partisi root & cek isi nyata ---
+          FAIL=0
+          zcat "$IMG" > /tmp/chk.img
+          LOOP=$(sudo losetup -fP --show /tmp/chk.img 2>/dev/null || true)
+          if [[ -z "$LOOP" ]]; then
+            echo "::warning::losetup gagal - verifikasi mendalam dilewati (grep string tetap lolos)"
+          else
+            ROOT=""
+            for p in ${LOOP}p*; do
+              if sudo debugfs -R "ls -p /etc/netplan" "$p" 2>/dev/null | grep -q "00-static-ip"; then
+                ROOT="$p"; break
+              fi
+            done
+            if [[ -z "$ROOT" ]]; then
+              echo "::error::Partisi root dengan /etc/netplan tidak ditemukan di image!"
+              FAIL=1
+            else
+              echo "root partition: $ROOT"
+              NP=$(sudo debugfs -R "ls -p /etc/netplan" "$ROOT" 2>/dev/null)
+              echo "netplan: $NP"
+
+              # (1) file statis ada & isinya IP yang benar
+              if ! echo "$NP" | grep -q "00-static-ip.yaml"; then
+                echo "::error::00-static-ip.yaml hilang dari image!"; FAIL=1
+              fi
+              if ! sudo debugfs -R "cat /etc/netplan/00-static-ip.yaml" "$ROOT" 2>/dev/null | grep -q "${{ inputs.static_ip%/* }}"; then
+                echo "::error::Isi 00-static-ip.yaml tidak berisi ${{ inputs.static_ip }}!"; FAIL=1
+              fi
+
+              # (2) netplan match-all DHCP HARUS sudah dibuang (kalau tidak,
+              #     networkd memilih match "e*" → IP statis tidak pernah aktif)
+              if echo "$NP" | grep -q "10-dhcp-all-interfaces"; then
+                echo "::error::10-dhcp-all-interfaces.yaml masih ada - IP statis akan kalah lagi!"; FAIL=1
+              else
+                echo "OK: netplan match-all DHCP sudah dibuang"
+              fi
+
+              # (3) zram + ramlog enabled sejak boot
+              for spec in "multi-user.target.wants:zramswap.service" "sysinit.target.wants:armbian-ramlog.service"; do
+                DIR="${spec%%:*}"; UNIT="${spec##*:}"
+                WANTS=$(sudo debugfs -R "ls -p /etc/systemd/system/$DIR" "$ROOT" 2>/dev/null)
+                if echo "$WANTS" | grep -q "$UNIT"; then
+                  echo "OK: $UNIT enabled"
+                else
+                  echo "::error::$UNIT TIDAK enabled di image!"; FAIL=1
+                fi
+              done
+
+              # (4) wpa_supplicant tidak boleh auto-start (tidak ada wifi)
+              MULTI=$(sudo debugfs -R "ls -p /etc/systemd/system/multi-user.target.wants" "$ROOT" 2>/dev/null)
+              if echo "$MULTI" | grep -q "wpa_supplicant"; then
+                echo "::error::wpa_supplicant masih auto-start di image!"; FAIL=1
+              else
+                echo "OK: wpa_supplicant disabled"
+              fi
+            fi
+            sudo losetup -d "$LOOP" 2>/dev/null || true
+            rm -f /tmp/chk.img
+          fi
+
+          if [[ "${FAIL}" -ne 0 ]]; then
+            echo "status=failed" >> ${GITHUB_OUTPUT}
+            exit 1
+          fi
+          echo "status=success" >> ${GITHUB_OUTPUT}
 
       - name: Upload rebuilt STB image to Release
         uses: ophub/upload-to-releases@main
@@ -306,7 +391,8 @@ jobs:
             ### Armbian Image STB HG680
             - Target: `${{ inputs.stb_model }}` (HG680P / HG680-FJ)
             - Release: `${{ inputs.set_release }}` — kernel `${{ inputs.armbian_kernel }}` (${{ inputs.kernel_usage }})
-            - Static IP: `${{ inputs.static_ip }}` via `${{ inputs.gateway_ip }}` (DHCP off)
+            - Static IP: `${{ inputs.static_ip }}` via `${{ inputs.gateway_ip }}` (netplan match-all DHCP dibuang → statis menang)
+            - zram + armbian-ramlog: aktif sejak boot (hemat tulis eMMC)
             - Extra packages: `${{ inputs.extra_packages || '-' }}`
             - Default username: `root`
             - Default password: `1234`
