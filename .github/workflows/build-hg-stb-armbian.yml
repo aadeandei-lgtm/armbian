@@ -293,6 +293,7 @@ jobs:
         if: ${{ steps.clean.outputs.status == 'success' && !cancelled() }}
         run: |
           # Cari file hasil rebuild target
+          STATIC_IP="${{ inputs.static_ip }}"
           IMG=$(ls build/output/images/Armbian_*${{ inputs.stb_model }}_*.img.gz 2>/dev/null | head -1)
           [[ -z "$IMG" ]] && IMG=$(ls ${PACKAGED_OUTPUTPATH:-/tmp/nonexistent}/*.img.gz 2>/dev/null | head -1)
           if [[ -z "$IMG" ]]; then
@@ -303,7 +304,7 @@ jobs:
           echo "Verifying [ $IMG ] ..."
 
           # --- Fallback lama: grep string mentah di dalam .img.gz ---
-          if ! zcat "$IMG" | grep -aq "${{ inputs.static_ip%/* }}"; then
+          if ! zcat "$IMG" | grep -aq "${STATIC_IP%/*}"; then
             echo "::error::Static IP ${{ inputs.static_ip }} TIDAK ditemukan di dalam image!"
             echo "status=failed" >> ${GITHUB_OUTPUT}
             exit 1
@@ -335,8 +336,8 @@ jobs:
               if ! echo "$NP" | grep -q "00-static-ip.yaml"; then
                 echo "::error::00-static-ip.yaml hilang dari image!"; FAIL=1
               fi
-              if ! sudo debugfs -R "cat /etc/netplan/00-static-ip.yaml" "$ROOT" 2>/dev/null | grep -q "${{ inputs.static_ip%/* }}"; then
-                echo "::error::Isi 00-static-ip.yaml tidak berisi ${{ inputs.static_ip }}!"; FAIL=1
+              if ! sudo debugfs -R "cat /etc/netplan/00-static-ip.yaml" "$ROOT" 2>/dev/null | grep -q "${STATIC_IP%/*}"; then
+                echo "::error::Isi 00-static-ip.yaml tidak berisi ${STATIC_IP}!"; FAIL=1
               fi
 
               # (2) netplan match-all DHCP HARUS sudah dibuang (kalau tidak,
