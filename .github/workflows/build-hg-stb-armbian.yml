@@ -298,9 +298,13 @@ jobs:
           # semua DTB di partisi boot image hasil rebuild + batasi frekuensi
           # eMMC 50MHz via cmdline (dokumentasi ophub).
           sudo apt-get install -y device-tree-compiler >/dev/null 2>&1
-          IMG=$(ls ${PACKAGED_OUTPUTPATH}/*.img.gz 2>/dev/null | head -1)
+          STB_MODEL="${{ inputs.stb_model }}"
+          # Pilih image hasil REBUILD target (filter model STB) - pola sama dgn step verify;
+          # glob tanpa filter salah ambil image trunk (bahan mentah).
+          IMG=$(ls build/output/images/Armbian_*${STB_MODEL}_*.img.gz 2>/dev/null | head -1)
+          [[ -z "$IMG" ]] && IMG=$(ls ${PACKAGED_OUTPUTPATH}/Armbian_*${STB_MODEL}_*.img.gz 2>/dev/null | head -1)
           if [[ -z "$IMG" ]]; then
-            echo "::warning::image hasil rebuild tidak ditemukan, patch DTB dilewati"
+            echo "::warning::image hasil rebuild ($STB_MODEL) tidak ditemukan, patch DTB dilewati"
             echo "status=skipped" >> ${GITHUB_OUTPUT}
             exit 0
           fi
