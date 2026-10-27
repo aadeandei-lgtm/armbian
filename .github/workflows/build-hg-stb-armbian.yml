@@ -288,6 +288,65 @@ jobs:
           armbian_fstype: ${{ inputs.armbian_fstype }}
           builder_name: ${{ inputs.builder_name }}
 
+      - name: Disable eMMC HS200 in DTB (fix mmc error -74)
+        id: hsfix
+        if: ${{ env.PACKAGED_STATUS == 'success' && !cancelled() }}
+        run: |
+          # Chip eMMC murah di STB HG (mis. DG4008) tidak stabil di mode HS200:
+          # dmesg "mmc_select_hs200 failed, error -74" lalu driver mundur ke
+          # DDR52 50MHz (tulis ~24MB/s). Hapus deklarasi mmc-hs200-1_8v dari
+          # semua DTB di partisi boot image hasil rebuild + batasi frekuensi
+          # eMMC 50MHz via cmdline (dokumentasi ophub).
+          sudo apt-get install -y device-tree-compiler >/dev/null 2>&1
+          IMG=$(ls ${PACKAGED_OUTPUTPATH}/*.img.gz 2>/dev/null | head -1)
+          if [[ -z "$IMG" ]]; then
+            echo "::warning::image hasil rebuild tidak ditemukan, patch DTB dilewati"
+            echo "status=skipped" >> ${GITHUB_OUTPUT}
+            exit 0
+          fi
+          echo "Patching DTB in [ $IMG ] ..."
+          zcat "$IMG" > /tmp/fix.img
+          LOOP=$(sudo losetup -fP --show /tmp/fix.img)
+          FIXED=0
+          for p in ${LOOP}p*; do
+            T=$(sudo blkid -o value -s TYPE "$p" 2>/dev/null || true)
+            [[ "$T" == "vfat" ]] || continue
+            MNT=$(mktemp -d)
+            sudo mount "$p" "$MNT"
+            # (1) buang mmc-hs200-1_8v dari semua DTB di partisi boot
+            while IFS= read -r DTB; do
+              dtc -I dtb -O dts -o /tmp/f.dts "$DTB" 2>/dev/null || continue
+              grep -q 'mmc-hs200-1_8v' /tmp/f.dts || continue
+              sed -i '/mmc-hs200-1_8v;/d' /tmp/f.dts
+              if dtc -I dts -O dtb -o /tmp/f.dtb /tmp/f.dts 2>/dev/null; then
+                sudo cp /tmp/f.dtb "$DTB"
+                echo "patched: ${DTB#$MNT}"
+                FIXED=$((FIXED+1))
+              else
+                echo "::warning::dtc gagal compile ulang $DTB"
+              fi
+            done < <(find "$MNT" -name '*.dtb' -type f)
+            # (2) cmdline batas frekuensi eMMC 50MHz (belt-and-braces)
+            if [[ -f "$MNT/uEnv.txt" ]] && ! grep -q 'mmc_core.max_freq=' "$MNT/uEnv.txt"; then
+              sudo sed -i 's|^APPEND=\(.*\)$|APPEND=\1 mmc_core.max_freq=50000000|' "$MNT/uEnv.txt"
+              echo "uEnv.txt: mmc_core.max_freq=50000000 ditambahkan"
+            fi
+            sudo umount "$MNT"
+            rmdir "$MNT"
+          done
+          sudo losetup -d "$LOOP"
+          if [[ "$FIXED" -eq 0 ]]; then
+            echo "::warning::tidak ada DTB ber-mmc-hs200-1_8v yang ditemukan"
+          fi
+          gzip -c /tmp/fix.img > "$IMG"
+          rm -f /tmp/fix.img
+          # perbarui checksum sampingan bila ada
+          for SHAF in "$IMG".sha*; do
+            [[ -f "$SHAF" ]] || continue
+            (cd "$(dirname "$IMG")" && sha256sum "$(basename "$IMG")" > "$(basename "$SHAF")")
+          done
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
       - name: Verify static IP & boot config baked into image
         id: verify
         if: ${{ steps.clean.outputs.status == 'success' && !cancelled() }}
@@ -367,6 +426,32 @@ jobs:
                 echo "OK: wpa_supplicant disabled"
               fi
             fi
+
+            # (5) patch HS200: partisi boot vfat → mount utk verifikasi
+            for p in ${LOOP}p*; do
+              T=$(sudo blkid -o value -s TYPE "$p" 2>/dev/null || true)
+              [[ "$T" == "vfat" ]] || continue
+              MNT=$(mktemp -d)
+              sudo mount "$p" "$MNT"
+              HS_LEFT=0; DTB_N=0
+              while IFS= read -r DTB; do
+                DTB_N=$((DTB_N+1))
+                dtc -I dtb -O dts -o /tmp/v.dts "$DTB" 2>/dev/null || continue
+                grep -q 'mmc-hs200-1_8v' /tmp/v.dts && HS_LEFT=$((HS_LEFT+1))
+              done < <(find "$MNT" -name '*.dtb' -type f)
+              echo "DTB diperiksa: $DTB_N, masih ada mmc-hs200-1_8v: $HS_LEFT"
+              if [[ "$HS_LEFT" -ne 0 ]]; then
+                echo "::error::DTB masih memuat mmc-hs200-1_8v - patch HS200 tidak masuk!"; FAIL=1
+              else
+                echo "OK: deklarasi mmc-hs200-1_8v sudah dibuang dari semua DTB"
+              fi
+              if grep -q 'mmc_core.max_freq=50000000' "$MNT/uEnv.txt" 2>/dev/null; then
+                echo "OK: mmc_core.max_freq=50000000 ada di uEnv.txt"
+              else
+                echo "::error::mmc_core.max_freq tidak ada di uEnv.txt!"; FAIL=1
+              fi
+              sudo umount "$MNT"; rmdir "$MNT"
+            done
             sudo losetup -d "$LOOP" 2>/dev/null || true
             rm -f /tmp/chk.img
           fi
@@ -402,5 +487,6 @@ jobs:
             ### Applicable Platform
             - 🐧 `arm64`
             - 📡 DTB meson: dipilih otomatis sesuai model STB
+            - 🔧 eMMC HS200 dimatikan di DTB + batas 50MHz (fix `error -74` → stabil di DDR52)
             - ✅ Static IP diverifikasi ada di dalam image saat build
             - Build: [run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
