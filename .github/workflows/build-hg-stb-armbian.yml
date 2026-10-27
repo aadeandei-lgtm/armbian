@@ -342,11 +342,15 @@ jobs:
           if [[ "$FIXED" -eq 0 ]]; then
             echo "::warning::tidak ada DTB ber-mmc-hs200-1_8v yang ditemukan"
           fi
+          # file image hasil rebuild dimiliki root → ambil alih dulu (tanpa ini
+          # redirect gzip ke $IMG gagal "Permission denied")
+          sudo chown "$(id -u):$(id -g)" "$IMG"
           gzip -c /tmp/fix.img > "$IMG"
           rm -f /tmp/fix.img
           # perbarui checksum sampingan bila ada
           for SHAF in "$IMG".sha*; do
             [[ -f "$SHAF" ]] || continue
+            sudo chown "$(id -u):$(id -g)" "$SHAF" 2>/dev/null || true
             (cd "$(dirname "$IMG")" && sha256sum "$(basename "$IMG")" > "$(basename "$SHAF")")
           done
           echo "status=success" >> ${GITHUB_OUTPUT}
