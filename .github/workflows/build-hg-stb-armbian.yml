@@ -234,12 +234,16 @@ jobs:
         if: ${{ steps.down.outputs.status == 'success' && !cancelled() }}
         run: |
           # Enable QEMU emulation for ARM cross-compilation.
-          # Penting: --reset -p yes TIDAK cukup di kernel/runner baru -> flag 'F' (fix_binary)
-          # hilang sehingga qemu-aarch64-static bisa segfault acak saat postinst dpkg
-          # (gejala: "python3-yaml post-installation script ... exit status 139" lalu
-          #  netplan.io gagal configure -> build mati). Flag 'F' wajib agar
-          #  qemu-static tidak crash; tambahkan juga -c yes (credential).
-          docker run --rm --privileged multiarch/qemu-user-static --reset -p yes -c yes 2>/dev/null || true
+          # FIX segfault emulasi arm64 di kernel runner baru (7.x-azure): bug QEMU-user +
+          # binfmt tanpa 'F' flag (libvirtigi/binfmt#215, docker/buildx#3170):
+          #   "python3-yaml post-installation script ... exit status 139" -> netplan.io
+          #   gagal configure -> build mati. Dua lapis pertahanan:
+          #   1) Matikan ASLR (workaround resmi dari thread isu tsb).
+          #   2) Register QEMU v9.2 dari tonistiigi/binfmt (lebih baru dari multiarch 8.2),
+          #      lalu pastikan flag 'F' (fix_binary) terpasang; fallback ke multiarch.
+          sudo sysctl -w kernel.randomize_va_space=0
+          docker run --rm --privileged tonistiigi/binfmt:qemu-v9.2.0 --install arm64 || \
+            docker run --rm --privileged multiarch/qemu-user-static --reset -p yes -c yes || true
           # Pastikan flag F terpasang; kalau tidak, paksa ulang.
           if ! grep -q '^flags:.*F' /proc/sys/fs/binfmt_misc/qemu-aarch64 2>/dev/null; then
             echo "::warning::flag F belum ada di binfmt qemu-aarch64 - paksa reset"
