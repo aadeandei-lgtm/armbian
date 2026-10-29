@@ -233,8 +233,20 @@ jobs:
         working-directory: /builder
         if: ${{ steps.down.outputs.status == 'success' && !cancelled() }}
         run: |
-          # Enable QEMU emulation for ARM cross-compilation
-          docker run --rm --privileged multiarch/qemu-user-static --reset -p yes 2>/dev/null || true
+          # Enable QEMU emulation for ARM cross-compilation.
+          # Penting: --reset -p yes TIDAK cukup di kernel/runner baru -> flag 'F' (fix_binary)
+          # hilang sehingga qemu-aarch64-static bisa segfault acak saat postinst dpkg
+          # (gejala: "python3-yaml post-installation script ... exit status 139" lalu
+          #  netplan.io gagal configure -> build mati). Flag 'F' wajib agar
+          #  qemu-static tidak crash; tambahkan juga -c yes (credential).
+          docker run --rm --privileged multiarch/qemu-user-static --reset -p yes -c yes 2>/dev/null || true
+          # Pastikan flag F terpasang; kalau tidak, paksa ulang.
+          if ! grep -q '^flags:.*F' /proc/sys/fs/binfmt_misc/qemu-aarch64 2>/dev/null; then
+            echo "::warning::flag F belum ada di binfmt qemu-aarch64 - paksa reset"
+            docker run --rm --privileged multiarch/qemu-user-static --reset -p yes -c yes || true
+          fi
+          echo "--- binfmt qemu-aarch64 ---"
+          cat /proc/sys/fs/binfmt_misc/qemu-aarch64 2>/dev/null || echo "qemu-aarch64 tidak terdaftar"
 
           # Set the board name for the base Armbian image
           config_board="${{ inputs.config_board }}"
