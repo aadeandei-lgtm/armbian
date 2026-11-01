@@ -76,6 +76,14 @@ on:
         description: "Gateway / DNS STB."
         required: false
         default: "192.168.4.1"
+      install_tailscale:
+        description: "yes = tambah repo resmi Tailscale + pasang paket tailscale ke image. no = lewati."
+        required: false
+        default: "yes"
+        type: choice
+        options:
+          - "yes"
+          - "no"
       builder_name:
         description: "Set Armbian builder signature."
         required: false
@@ -166,13 +174,21 @@ jobs:
           EXTRA="${{ inputs.extra_packages }}"
           STATIC_IP="${{ inputs.static_ip }}"
           GATEWAY="${{ inputs.gateway_ip }}"
+          INSTALL_TS="${{ inputs.install_tailscale }}"
           mkdir -p userpatches
-          cat > userpatches/customize-image.sh <<EOF
+
+          # Template ditulis dengan heredoc TERKUTIP (<<'CUSTOM_EOF') sehingga TIDAK
+          # ada ekspansi shell sama sekali: $VAR, $(...), dan backslash sampai utuh.
+          # Nilai dari input workflow disuntikkan lewat sed pada placeholder __X__
+          # (pengganti dipilih __ agar tak bertabrakan dengan sintaks shell apa pun).
+          cat > userpatches/customize-image.sh.tmpl <<'CUSTOM_EOF'
           #!/bin/bash
-          # Hook kustomisasi image - dijalankan di chroot rootfs saat build
-          # \$1=RELEASE \$2=LINUXFAMILY \$3=BOARD \$4=BUILD_DESKTOP \$5=VARIANT \$6=BUILD_MINIMAL
+          # Hook kustomisasi image - dijalankan di chroot rootfs saat build.
+          # $1=RELEASE $2=LINUXFAMILY $3=BOARD $4=BUILD_DESKTOP $5=VARIANT $6=BUILD_MINIMAL
           set -e
           export DEBIAN_FRONTEND=noninteractive
+
+          INSTALL_TS="__INSTALL_TS__"
 
           # --- IP statis via netplan (persisten, DHCP dimatikan) ---
           mkdir -p /etc/netplan
@@ -184,10 +200,10 @@ jobs:
               eth0:
                 dhcp4: no
                 addresses:
-                  - ${STATIC_IP}
+                  - __STATIC_IP__
                 routes:
                   - to: 0.0.0.0/0
-                    via: ${GATEWAY}
+                    via: __GATEWAY__
                 nameservers:
                   addresses:
                     - 9.9.9.9
@@ -196,7 +212,7 @@ jobs:
           chmod 600 /etc/netplan/00-static-ip.yaml
 
           # --- Buang netplan match-all (ditulis ekstensi networkd SETELAH file ini
-          #     disalin ke rootfs; match "e*" menang di networkd → IP statis tidak
+          #     disalin ke rootfs; match "e*" menang di networkd -> IP statis tidak
           #     pernah terpakai di perangkat nyata) ---
           rm -f /etc/netplan/10-dhcp-all-interfaces.yaml /etc/netplan/10-dhcp-*.yaml
 
@@ -211,21 +227,64 @@ jobs:
                  /etc/systemd/system/sysinit.target.wants/
 
           # --- wpa_supplicant mati (STB HG tidak punya wifi) ---
-          rm -f /etc/systemd/system/multi-user.target.wants/wpa_supplicant.service \\
+          rm -f /etc/systemd/system/multi-user.target.wants/wpa_supplicant.service \
                 /lib/systemd/system/multi-user.target.wants/wpa_supplicant.service
 
-          # --- extra packages ---
+          # --- Tailscale: repo resmi + keyring (dikendalikan input install_tailscale) ---
+          #     Keyring resmi (bytes identik Debian/Ubuntu) dari pkgs.tailscale.com:
+          #     paket tailscale TIDAK ada di repo Debian/Ubuntu bawaan, jadi repo
+          #     pihak ketiga ini wajib. Vendor dideteksi dari /etc/os-release.
+          if [ "${INSTALL_TS}" = "yes" ]; then
+            # shellcheck disable=SC1091
+            . /etc/os-release
+            case "${ID:-debian}" in
+              ubuntu) TS_VENDOR=ubuntu ;;
+              *)      TS_VENDOR=debian ;;
+            esac
+            TS_CODENAME="${VERSION_CODENAME:-}"
+            TS_BASE="https://pkgs.tailscale.com/stable/${TS_VENDOR}"
+            ts_fetch() {  # $1=url  $2=tujuan
+              if command -v curl >/dev/null 2>&1; then
+                curl -fsSL --retry 3 --max-time 60 "$1" -o "$2"
+              elif command -v wget >/dev/null 2>&1; then
+                wget -qO "$2" --tries=3 --timeout=60 "$1"
+              else
+                return 1
+              fi
+            }
+            if [ -n "${TS_CODENAME}" ] &&
+               ts_fetch "${TS_BASE}/${TS_CODENAME}.noarmor.gpg" /usr/share/keyrings/tailscale-archive-keyring.gpg &&
+               ts_fetch "${TS_BASE}/${TS_CODENAME}.tailscale-keyring.list" /etc/apt/sources.list.d/tailscale.list; then
+              echo "[customize] repo Tailscale ditambahkan: ${TS_VENDOR}/${TS_CODENAME}"
+            else
+              echo "[customize] PERINGATAN: repo Tailscale gagal dipasang (codename=${TS_CODENAME:-?}) - lanjut tanpa tailscale"
+              rm -f /etc/apt/sources.list.d/tailscale.list
+            fi
+          fi
+
+          # --- extra packages (+ tailscale bila repo-nya berhasil ditambahkan) ---
           apt-get update || true
-          if [ -n "${EXTRA}" ]; then
-            echo "[customize] Installing extra packages: ${EXTRA}"
-            apt-get install -y --no-install-recommends ${EXTRA} || true
+          PKGS="__EXTRA__"
+          if [ -f /etc/apt/sources.list.d/tailscale.list ]; then
+            PKGS="${PKGS} tailscale"
+          fi
+          if [ -n "$(echo ${PKGS} | tr -d ' ')" ]; then
+            echo "[customize] Installing packages: ${PKGS}"
+            apt-get install -y --no-install-recommends ${PKGS} || true
           fi
           apt-get clean || true
           rm -rf /var/lib/apt/lists/* 2>/dev/null || true
           exit 0
-          EOF
+          CUSTOM_EOF
+
+          sed -e "s|__STATIC_IP__|${STATIC_IP}|g" \
+              -e "s|__GATEWAY__|${GATEWAY}|g" \
+              -e "s|__EXTRA__|${EXTRA}|g" \
+              -e "s|__INSTALL_TS__|${INSTALL_TS}|g" \
+              userpatches/customize-image.sh.tmpl > userpatches/customize-image.sh
+          rm -f userpatches/customize-image.sh.tmpl
           chmod +x userpatches/customize-image.sh
-          echo "extra packages: [${EXTRA}] | static ip: [${STATIC_IP}] via [${GATEWAY}]"
+          echo "extra packages: [${EXTRA}] | static ip: [${STATIC_IP}] via [${GATEWAY}] | tailscale: [${INSTALL_TS}]"
           echo "status=success" >> ${GITHUB_OUTPUT}
 
       - name: Compile Armbian [ ${{ inputs.set_release }} ]
