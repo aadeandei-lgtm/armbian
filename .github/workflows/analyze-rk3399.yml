@@ -11,62 +11,78 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq fdisk parted e2fsprogs dosfstools binutils file device-tree-compiler
+          sudo apt-get install -y -qq fdisk e2fsprogs dosfstools binutils file device-tree-compiler
 
       - name: Download reference image (470 MB)
         run: |
           echo "Downloading armbian_21.05_server_full.img.gz ..."
           curl -fL --retry 3 --retry-delay 5 -o ref.img.gz "https://files.kos.org.cn/rockchip/YSKJ_RK3399/Armbian/armbian_21.05_server_full.img.gz"
           ls -lh ref.img.gz
+          gzip -t ref.img.gz && echo "gzip integrity: OK"
 
       - name: Decompress
         run: |
           gzip -d -k ref.img.gz
           ls -lh ref.img
+          stat -c 'image bytes: %s' ref.img
 
       - name: Partition table
         run: sudo fdisk -l ref.img | tee partition.txt
 
       - name: Map loop devices
         run: |
+          touch mounts.txt
           LOOP=$(sudo losetup -fP --show ref.img)
           echo "$LOOP" > loopdev.txt
           echo "LOOP=$LOOP"
-          sudo blkid ${LOOP}p* | tee blkid.txt
+          sudo blkid ${LOOP}p* | tee blkid.txt || true
 
-      - name: Mount and dump boot config
+      - name: Superblock (dumpe2fs)
         run: |
           LOOP=$(cat loopdev.txt)
-          sudo mkdir -p /mnt/boot /mnt/root
           for p in ${LOOP}p*; do
-            TYPE=$(sudo blkid -o value -s TYPE "$p" || true)
-            echo "PART $p TYPE=$TYPE"
-            case "$TYPE" in
-              vfat|fat16|fat32) sudo mount -o ro "$p" /mnt/boot && echo "BOOT=$p" >> mounts.txt ;;
-              ext4) sudo mount -o ro "$p" /mnt/root && echo "ROOT=$p" >> mounts.txt ;;
-            esac
+            if sudo blkid -o value -s TYPE "$p" | grep -q ext4; then
+              sudo dumpe2fs -h "$p" 2>&1 | tee superblock.txt
+              echo "$p" > ext4part.txt
+              break
+            fi
           done
-          echo "=== boot listing ===" | tee boot-list.txt
-          sudo find /mnt/boot -maxdepth 3 -type f -printf '%P %s bytes\n' | sort | tee -a boot-list.txt
+          [ -f superblock.txt ] || echo "(no ext4 found)" | tee superblock.txt
+
+      - name: Extract boot content via debugfs (no mount)
+        run: |
+          P=$(cat ext4part.txt 2>/dev/null || echo "")
+          mkdir -p bootdump
+          touch boot-list.txt boot-config.txt dtb-list.txt rootfs-info.txt
+          if [ -z "$P" ]; then echo "no ext4 partition" | tee boot-list.txt; exit 0; fi
+          echo "=== /boot via debugfs ===" | tee boot-list.txt
+          sudo debugfs -R "ls -l /boot" "$P" 2>&1 | tee -a boot-list.txt || true
+          echo "=== rdump /boot ===" | tee -a boot-list.txt
+          sudo debugfs -R "rdump /boot ./bootdump" "$P" 2>&1 | tee -a boot-list.txt || true
+          find ./bootdump -maxdepth 3 -type f -printf '%P %s bytes\n' | sort | tee -a boot-list.txt || true
           echo "=== boot config files ===" | tee boot-config.txt
-          for f in /mnt/boot/armbianEnv.txt /mnt/boot/uEnv.txt /mnt/boot/extlinux/extlinux.conf /mnt/boot/boot.cmd; do
-            if [ -f "$f" ]; then echo "----- $f -----" | tee -a boot-config.txt; sudo cat "$f" | tee -a boot-config.txt; fi
+          for f in ./bootdump/armbianEnv.txt ./bootdump/uEnv.txt ./bootdump/extlinux/extlinux.conf ./bootdump/boot.cmd ./bootdump/boot.scr; do
+            if [ -f "$f" ]; then echo "----- $f -----" | tee -a boot-config.txt; cat "$f" | tee -a boot-config.txt; fi
           done
           echo "=== DTB files ===" | tee dtb-list.txt
-          sudo find /mnt/boot -iname '*.dtb' -printf '%P\n' | sort | tee -a dtb-list.txt
+          find ./bootdump -iname '*.dtb' -printf '%P %s bytes\n' | sort | tee -a dtb-list.txt || true
 
-      - name: Dump rootfs identity
+      - name: Dump rootfs identity via debugfs
         run: |
+          P=$(cat ext4part.txt 2>/dev/null || echo "")
+          if [ -z "$P" ]; then echo "(no ext4)" | tee rootfs-info.txt; exit 0; fi
           echo "=== armbian-release ===" | tee rootfs-info.txt
-          sudo cat /mnt/root/etc/armbian-release 2>/dev/null | tee -a rootfs-info.txt || true
+          sudo debugfs -R "cat /etc/armbian-release" "$P" 2>/dev/null | tee -a rootfs-info.txt || true
           echo "=== os-release ===" | tee -a rootfs-info.txt
-          sudo cat /mnt/root/etc/os-release | tee -a rootfs-info.txt
-          echo "=== kernel modules ===" | tee -a rootfs-info.txt
-          sudo ls /mnt/root/lib/modules | tee -a rootfs-info.txt
-          echo "=== /boot in rootfs ===" | tee -a rootfs-info.txt
-          sudo find /mnt/root/boot -maxdepth 2 -type f -printf '%P %s\n' 2>/dev/null | sort | tee -a rootfs-info.txt
-          echo "=== u-boot pkgs ===" | tee -a rootfs-info.txt
-          sudo ls -d /mnt/root/usr/lib/u-boot* 2>/dev/null | tee -a rootfs-info.txt || true
+          sudo debugfs -R "cat /etc/os-release" "$P" 2>/dev/null | tee -a rootfs-info.txt || true
+          echo "=== /lib/modules ===" | tee -a rootfs-info.txt
+          sudo debugfs -R "ls -p /lib/modules" "$P" 2>/dev/null | tee -a rootfs-info.txt || true
+          echo "=== /usr/lib/u-boot ===" | tee -a rootfs-info.txt
+          sudo debugfs -R "ls -p /usr/lib" "$P" 2>/dev/null | grep -i u-boot | tee -a rootfs-info.txt || true
+          echo "=== kernel version string ===" | tee -a rootfs-info.txt
+          if [ -f ./bootdump/zImage ]; then
+            strings ./bootdump/zImage | grep -m1 'Linux version' | tee -a rootfs-info.txt || true
+          fi
 
       - name: Bootloader signature
         run: |
@@ -90,14 +106,19 @@ jobs:
 
       - name: DTB decompile (rk3399)
         run: |
-          for d in $(sudo find /mnt/boot -iname 'rk3399*.dtb' | head -6); do
+          touch dtb-decompiled.txt
+          for d in $(find ./bootdump -iname '*.dtb' | head -8); do
             echo "===== $d =====" | tee -a dtb-decompiled.txt
-            dtc -I dtb -O dts "$d" 2>/dev/null | head -150 | tee -a dtb-decompiled.txt
+            dtc -I dtb -O dts "$d" 2>/dev/null | head -120 | tee -a dtb-decompiled.txt || true
           done
+          [ -s dtb-decompiled.txt ] || echo "(no dtb found)" | tee -a dtb-decompiled.txt
 
       - name: Build report
         run: |
-          cat partition.txt blkid.txt mounts.txt boot-list.txt boot-config.txt dtb-list.txt rootfs-info.txt bootloader.txt dtb-decompiled.txt > REPORT.txt
+          : > REPORT.txt
+          for f in partition.txt blkid.txt superblock.txt mounts.txt boot-list.txt boot-config.txt dtb-list.txt rootfs-info.txt bootloader.txt dtb-decompiled.txt; do
+            if [ -f "$f" ]; then echo "########## $f ##########" >> REPORT.txt; cat "$f" >> REPORT.txt; fi
+          done
           echo "REPORT lines: $(wc -l < REPORT.txt)"
 
       - name: Upload report
@@ -108,8 +129,10 @@ jobs:
             REPORT.txt
             partition.txt
             blkid.txt
+            superblock.txt
             boot-config.txt
             dtb-list.txt
             rootfs-info.txt
             bootloader.txt
             dtb-decompiled.txt
+            bootdump/
