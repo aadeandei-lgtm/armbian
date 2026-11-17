@@ -488,6 +488,9 @@ jobs:
       - name: Rebuild Armbian for target boards
         uses: ophub/amlogic-s9xxx-armbian@main
         if: ${{ steps.clean.outputs.status == 'success' && !cancelled() }}
+        # Step repack khusus Amlogic; board non-Amlogic (mis. RK3399) gagal di
+        # KERNEL_TAGS — jangan mematikan run (image utama sudah ter-upload).
+        continue-on-error: true
         with:
           build_target: armbian
           armbian_path: build/output/images/*.img.gz
