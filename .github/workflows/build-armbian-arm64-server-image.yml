@@ -443,6 +443,11 @@ jobs:
           config_board="${{ inputs.config_board }}"
           [[ -z "${config_board}" ]] && config_board="odroidn2"
 
+          # Workaround: drop patch CAN yang sudah masuk mainline 6.18.64
+          # ("Reversed (or previously applied) patch detected" -> build batal).
+          # Upstream hanya menghapusnya dari arsip 7.3 (commit 4d731b2b).
+          rm -fv build/patch/kernel/archive/rockchip64-6.18/general-can-3-dev-can_put_echo_skb-free-skb-on-invalid-echo-in.patch || true
+
           # Compile options reference: https://docs.armbian.com/Developer-Guide_Build-Options
           cd build/
               ./compile.sh RELEASE=${{ matrix.release }} BOARD=${config_board} BRANCH=current BUILD_MINIMAL=no \
