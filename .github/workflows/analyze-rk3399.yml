@@ -11,112 +11,126 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq fdisk e2fsprogs dosfstools binutils file device-tree-compiler
+          sudo apt-get install -y -qq fdisk e2fsprogs binutils file device-tree-compiler
 
       - name: Download reference image (470 MB)
         run: |
-          echo "Downloading armbian_21.05_server_full.img.gz ..."
           curl -fL --retry 3 --retry-delay 5 -o ref.img.gz "https://files.kos.org.cn/rockchip/YSKJ_RK3399/Armbian/armbian_21.05_server_full.img.gz"
-          ls -lh ref.img.gz
           gzip -t ref.img.gz && echo "gzip integrity: OK"
+          ls -lh ref.img.gz
 
-      - name: Decompress
+      - name: Decompress + partition table
         run: |
           gzip -d -k ref.img.gz
-          ls -lh ref.img
-          stat -c 'image bytes: %s' ref.img
+          stat -c 'image bytes: %s' ref.img | tee partition.txt
+          sudo fdisk -l ref.img | tee -a partition.txt
 
-      - name: Partition table
-        run: sudo fdisk -l ref.img | tee partition.txt
-
-      - name: Map loop devices
+      - name: Extract partition + pad sparse to claimed size
         run: |
-          touch mounts.txt
-          LOOP=$(sudo losetup -fP --show ref.img)
-          echo "$LOOP" > loopdev.txt
-          echo "LOOP=$LOOP"
-          sudo blkid ${LOOP}p* | tee blkid.txt || true
+          # partisi mulai sector 32768 (16 MB)
+          dd if=ref.img of=root.img bs=512 skip=32768 status=progress
+          # ukuran klaim dari superblock
+          BLOCKS=$(sudo dumpe2fs -h root.img 2>/dev/null | awk '/^Block count/{print $3}')
+          BS=$(sudo dumpe2fs -h root.img 2>/dev/null | awk '/^Block size/{print $3}')
+          echo "fs claims: $BLOCKS blocks x $BS = $((BLOCKS*BS)) bytes" | tee -a partition.txt
+          truncate -s $((BLOCKS*BS)) root.img
+          ls -lh root.img; du -h root.img
+          sudo dumpe2fs -h root.img 2>/dev/null | tee superblock.txt
 
-      - name: Superblock (dumpe2fs)
+      - name: Extract /boot and rootfs identity (debugfs, no mount)
         run: |
-          LOOP=$(cat loopdev.txt)
-          for p in ${LOOP}p*; do
-            if sudo blkid -o value -s TYPE "$p" | grep -q ext4; then
-              sudo dumpe2fs -h "$p" 2>&1 | tee superblock.txt
-              echo "$p" > ext4part.txt
-              break
-            fi
-          done
-          [ -f superblock.txt ] || echo "(no ext4 found)" | tee superblock.txt
-
-      - name: Extract boot content via debugfs (no mount)
-        run: |
-          P=$(cat ext4part.txt 2>/dev/null || echo "")
-          mkdir -p bootdump
           touch boot-list.txt boot-config.txt dtb-list.txt rootfs-info.txt
-          if [ -z "$P" ]; then echo "no ext4 partition" | tee boot-list.txt; exit 0; fi
-          echo "=== /boot via debugfs ===" | tee boot-list.txt
-          sudo debugfs -R "ls -l /boot" "$P" 2>&1 | tee -a boot-list.txt || true
+          mkdir -p bootdump
+          sudo debugfs -R "ls -p /" root.img 2>&1 | tee boot-list.txt
+          echo "=== /boot ===" | tee -a boot-list.txt
+          sudo debugfs -R "ls -l /boot" root.img 2>&1 | tee -a boot-list.txt
           echo "=== rdump /boot ===" | tee -a boot-list.txt
-          sudo debugfs -R "rdump /boot ./bootdump" "$P" 2>&1 | tee -a boot-list.txt || true
-          find ./bootdump -maxdepth 3 -type f -printf '%P %s bytes\n' | sort | tee -a boot-list.txt || true
-          echo "=== boot config files ===" | tee boot-config.txt
-          for f in ./bootdump/armbianEnv.txt ./bootdump/uEnv.txt ./bootdump/extlinux/extlinux.conf ./bootdump/boot.cmd ./bootdump/boot.scr; do
+          sudo debugfs -R "rdump /boot ./bootdump" root.img 2>&1 | tee -a boot-list.txt || true
+          find ./bootdump -type f -printf '%P %s bytes\n' | sort | tee -a boot-list.txt || true
+
+          echo "=== boot config ===" | tee boot-config.txt
+          for f in ./bootdump/armbianEnv.txt ./bootdump/uEnv.txt ./bootdump/extlinux/extlinux.conf ./bootdump/boot.cmd; do
             if [ -f "$f" ]; then echo "----- $f -----" | tee -a boot-config.txt; cat "$f" | tee -a boot-config.txt; fi
           done
+          if [ -f ./bootdump/boot.scr ]; then
+            echo "----- boot.scr (strings) -----" | tee -a boot-config.txt
+            strings ./bootdump/boot.scr | head -80 | tee -a boot-config.txt
+          fi
+
           echo "=== DTB files ===" | tee dtb-list.txt
           find ./bootdump -iname '*.dtb' -printf '%P %s bytes\n' | sort | tee -a dtb-list.txt || true
 
-      - name: Dump rootfs identity via debugfs
-        run: |
-          P=$(cat ext4part.txt 2>/dev/null || echo "")
-          if [ -z "$P" ]; then echo "(no ext4)" | tee rootfs-info.txt; exit 0; fi
           echo "=== armbian-release ===" | tee rootfs-info.txt
-          sudo debugfs -R "cat /etc/armbian-release" "$P" 2>/dev/null | tee -a rootfs-info.txt || true
+          sudo debugfs -R "cat /etc/armbian-release" root.img 2>/dev/null | tee -a rootfs-info.txt || true
           echo "=== os-release ===" | tee -a rootfs-info.txt
-          sudo debugfs -R "cat /etc/os-release" "$P" 2>/dev/null | tee -a rootfs-info.txt || true
+          sudo debugfs -R "cat /etc/os-release" root.img 2>/dev/null | tee -a rootfs-info.txt || true
           echo "=== /lib/modules ===" | tee -a rootfs-info.txt
-          sudo debugfs -R "ls -p /lib/modules" "$P" 2>/dev/null | tee -a rootfs-info.txt || true
-          echo "=== /usr/lib/u-boot ===" | tee -a rootfs-info.txt
-          sudo debugfs -R "ls -p /usr/lib" "$P" 2>/dev/null | grep -i u-boot | tee -a rootfs-info.txt || true
-          echo "=== kernel version string ===" | tee -a rootfs-info.txt
-          if [ -f ./bootdump/zImage ]; then
-            strings ./bootdump/zImage | grep -m1 'Linux version' | tee -a rootfs-info.txt || true
-          fi
+          sudo debugfs -R "ls -p /lib/modules" root.img 2>/dev/null | tee -a rootfs-info.txt || true
+          echo "=== /extlinux in root ===" | tee -a rootfs-info.txt
+          sudo debugfs -R "ls -l /etc" root.img 2>/dev/null | grep -i extlinux | tee -a rootfs-info.txt || true
+          echo "=== kernel image ===" | tee -a rootfs-info.txt
+          for k in ./bootdump/Image ./bootdump/Image.gz ./bootdump/zImage; do
+            if [ -f "$k" ]; then ls -l "$k" | tee -a rootfs-info.txt; strings -n 12 "$k" | grep -m2 'Linux version' | tee -a rootfs-info.txt || true; fi
+          done
 
       - name: Bootloader signature
         run: |
-          echo "=== bootloader strings (first 32MB) ===" | tee bootloader.txt
-          head -c 33554432 ref.img | strings -n 6 | head -250 | tee -a bootloader.txt
-          echo "=== MBR hexdump ===" | tee -a bootloader.txt
+          echo "=== MBR hexdump ===" | tee bootloader.txt
           head -c 512 ref.img | od -Ax -tx1z -v | tee -a bootloader.txt
-          echo "=== marker offsets ===" | tee -a bootloader.txt
-          python3 - <<'PY' | tee -a bootloader.txt
-          data = open('ref.img','rb').read(16*1024*1024)
-          for needle in [b'idbloader', b'U-Boot', b'ROCKCHIP', b'RK3399', b'TPL', b'SPL', b'DDR']:
-            offs = []
-            i = 0
-            while True:
-              j = data.find(needle, i)
-              if j < 0: break
-              offs.append(hex(j)); i = j + 1
-              if len(offs) > 12: break
-            print(needle.decode(errors='replace'), offs)
-          PY
+          echo "=== bootloader strings (first 16MB) ===" | tee -a bootloader.txt
+          head -c 16777216 ref.img | strings -n 8 | grep -iE 'u-boot|rk3399|idbloader|spl|ddr|armbian|version' | sort -u | head -60 | tee -a bootloader.txt
 
-      - name: DTB decompile (rk3399)
+      - name: DTB decompile
         run: |
           touch dtb-decompiled.txt
-          for d in $(find ./bootdump -iname '*.dtb' | head -8); do
+          for d in $(find ./bootdump -iname '*.dtb' | sort); do
             echo "===== $d =====" | tee -a dtb-decompiled.txt
-            dtc -I dtb -O dts "$d" 2>/dev/null | head -120 | tee -a dtb-decompiled.txt || true
+            dtc -I dtb -O dts "$d" 2>&1 | head -80 | tee -a dtb-decompiled.txt || true
           done
           [ -s dtb-decompiled.txt ] || echo "(no dtb found)" | tee -a dtb-decompiled.txt
+          # sanity: magic bytes semua dtb
+          echo "=== dtb magic check ===" | tee -a dtb-decompiled.txt
+          for d in $(find ./bootdump -iname '*.dtb' | sort); do
+            printf '%s : ' "$d"; head -c4 "$d" | od -An -tx1 | tr -d ' \n'; echo | tee -a dtb-decompiled.txt
+          done || true
+
+      - name: Raw carve DTB from image (FDT magic scan)
+        run: |
+          mkdir -p carved
+          python3 - <<'PY'
+          import struct, os, subprocess
+          MAGIC = bytes([0xd0, 0x0d, 0xfe, 0xed])
+          data = open('ref.img','rb').read()
+          found = []
+          i = 0
+          while True:
+              j = data.find(MAGIC, i)
+              if j < 0: break
+              # ukuran dtb dari header big-endian di offset 4
+              if j + 40 <= len(data):
+                  totalsize = struct.unpack('>I', data[j+4:j+8])[0]
+                  if 64 <= totalsize <= 262144 and j + totalsize <= len(data):
+                      name = f'carved/dtb-{len(found):02d}-off-{j:x}.dtb'
+                      open(name,'wb').write(data[j:j+totalsize])
+                      found.append((name, j, totalsize))
+              i = j + 4
+          print(f'carved {len(found)} DTB candidates')
+          for n,o,s in found: print(f'  {n} offset=0x{o:x} size={s}')
+          PY
+          echo "=== carved dtb dtc check ===" | tee carved-dtb.txt
+          for d in carved/*.dtb; do
+            [ -f "$d" ] || continue
+            echo "----- $d -----" | tee -a carved-dtb.txt
+            dtc -I dtb -O dts "$d" 2>&1 | grep -m6 -E 'model|compatible' | tee -a carved-dtb.txt || true
+          done
+          # filename search di raw image
+          echo "=== .dtb filenames in raw image ===" | tee -a carved-dtb.txt
+          strings -n 6 ref.img | grep -E '\.dtb$' | sort -u | head -60 | tee -a carved-dtb.txt || true
 
       - name: Build report
         run: |
           : > REPORT.txt
-          for f in partition.txt blkid.txt superblock.txt mounts.txt boot-list.txt boot-config.txt dtb-list.txt rootfs-info.txt bootloader.txt dtb-decompiled.txt; do
+          for f in partition.txt superblock.txt boot-list.txt boot-config.txt dtb-list.txt rootfs-info.txt bootloader.txt dtb-decompiled.txt carved-dtb.txt; do
             if [ -f "$f" ]; then echo "########## $f ##########" >> REPORT.txt; cat "$f" >> REPORT.txt; fi
           done
           echo "REPORT lines: $(wc -l < REPORT.txt)"
@@ -128,11 +142,13 @@ jobs:
           path: |
             REPORT.txt
             partition.txt
-            blkid.txt
             superblock.txt
             boot-config.txt
             dtb-list.txt
             rootfs-info.txt
             bootloader.txt
             dtb-decompiled.txt
+            carved-dtb.txt
+            carved/
             bootdump/
+          if-no-files-found: warn
