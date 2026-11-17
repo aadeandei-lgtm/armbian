@@ -1,0 +1,115 @@
+name: Analyze RK3399 Reference Image
+
+on:
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fdisk parted e2fsprogs dosfstools binutils file device-tree-compiler
+
+      - name: Download reference image (470 MB)
+        run: |
+          echo "Downloading armbian_21.05_server_full.img.gz ..."
+          curl -fL --retry 3 --retry-delay 5 -o ref.img.gz "https://files.kos.org.cn/rockchip/YSKJ_RK3399/Armbian/armbian_21.05_server_full.img.gz"
+          ls -lh ref.img.gz
+
+      - name: Decompress
+        run: |
+          gzip -d -k ref.img.gz
+          ls -lh ref.img
+
+      - name: Partition table
+        run: sudo fdisk -l ref.img | tee partition.txt
+
+      - name: Map loop devices
+        run: |
+          LOOP=$(sudo losetup -fP --show ref.img)
+          echo "$LOOP" > loopdev.txt
+          echo "LOOP=$LOOP"
+          sudo blkid ${LOOP}p* | tee blkid.txt
+
+      - name: Mount and dump boot config
+        run: |
+          LOOP=$(cat loopdev.txt)
+          sudo mkdir -p /mnt/boot /mnt/root
+          for p in ${LOOP}p*; do
+            TYPE=$(sudo blkid -o value -s TYPE "$p" || true)
+            echo "PART $p TYPE=$TYPE"
+            case "$TYPE" in
+              vfat|fat16|fat32) sudo mount -o ro "$p" /mnt/boot && echo "BOOT=$p" >> mounts.txt ;;
+              ext4) sudo mount -o ro "$p" /mnt/root && echo "ROOT=$p" >> mounts.txt ;;
+            esac
+          done
+          echo "=== boot listing ===" | tee boot-list.txt
+          sudo find /mnt/boot -maxdepth 3 -type f -printf '%P %s bytes\n' | sort | tee -a boot-list.txt
+          echo "=== boot config files ===" | tee boot-config.txt
+          for f in /mnt/boot/armbianEnv.txt /mnt/boot/uEnv.txt /mnt/boot/extlinux/extlinux.conf /mnt/boot/boot.cmd; do
+            if [ -f "$f" ]; then echo "----- $f -----" | tee -a boot-config.txt; sudo cat "$f" | tee -a boot-config.txt; fi
+          done
+          echo "=== DTB files ===" | tee dtb-list.txt
+          sudo find /mnt/boot -iname '*.dtb' -printf '%P\n' | sort | tee -a dtb-list.txt
+
+      - name: Dump rootfs identity
+        run: |
+          echo "=== armbian-release ===" | tee rootfs-info.txt
+          sudo cat /mnt/root/etc/armbian-release 2>/dev/null | tee -a rootfs-info.txt || true
+          echo "=== os-release ===" | tee -a rootfs-info.txt
+          sudo cat /mnt/root/etc/os-release | tee -a rootfs-info.txt
+          echo "=== kernel modules ===" | tee -a rootfs-info.txt
+          sudo ls /mnt/root/lib/modules | tee -a rootfs-info.txt
+          echo "=== /boot in rootfs ===" | tee -a rootfs-info.txt
+          sudo find /mnt/root/boot -maxdepth 2 -type f -printf '%P %s\n' 2>/dev/null | sort | tee -a rootfs-info.txt
+          echo "=== u-boot pkgs ===" | tee -a rootfs-info.txt
+          sudo ls -d /mnt/root/usr/lib/u-boot* 2>/dev/null | tee -a rootfs-info.txt || true
+
+      - name: Bootloader signature
+        run: |
+          echo "=== bootloader strings (first 32MB) ===" | tee bootloader.txt
+          head -c 33554432 ref.img | strings -n 6 | head -250 | tee -a bootloader.txt
+          echo "=== MBR hexdump ===" | tee -a bootloader.txt
+          head -c 512 ref.img | od -Ax -tx1z -v | tee -a bootloader.txt
+          echo "=== marker offsets ===" | tee -a bootloader.txt
+          python3 - <<'PY' | tee -a bootloader.txt
+          data = open('ref.img','rb').read(16*1024*1024)
+          for needle in [b'idbloader', b'U-Boot', b'ROCKCHIP', b'RK3399', b'TPL', b'SPL', b'DDR']:
+            offs = []
+            i = 0
+            while True:
+              j = data.find(needle, i)
+              if j < 0: break
+              offs.append(hex(j)); i = j + 1
+              if len(offs) > 12: break
+            print(needle.decode(errors='replace'), offs)
+          PY
+
+      - name: DTB decompile (rk3399)
+        run: |
+          for d in $(sudo find /mnt/boot -iname 'rk3399*.dtb' | head -6); do
+            echo "===== $d =====" | tee -a dtb-decompiled.txt
+            dtc -I dtb -O dts "$d" 2>/dev/null | head -150 | tee -a dtb-decompiled.txt
+          done
+
+      - name: Build report
+        run: |
+          cat partition.txt blkid.txt mounts.txt boot-list.txt boot-config.txt dtb-list.txt rootfs-info.txt bootloader.txt dtb-decompiled.txt > REPORT.txt
+          echo "REPORT lines: $(wc -l < REPORT.txt)"
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: rk3399-analysis
+          path: |
+            REPORT.txt
+            partition.txt
+            blkid.txt
+            boot-config.txt
+            dtb-list.txt
+            rootfs-info.txt
+            bootloader.txt
+            dtb-decompiled.txt
