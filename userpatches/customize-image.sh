@@ -72,10 +72,18 @@ else
     exit 1
 fi
 
-# Jejak audit di dalam image.
+# Jejak audit di dalam image — JANGAN tulis ke /etc/armbian-release: berkas itu
+# di-source sebagai bash oleh /etc/initramfs/post-update.d/99-uboot, sehingga baris
+# non-komponen (mis. "yskg-dtbfix RELEASE=...") memicu "not found" dan mematikan build.
 {
-    echo "yskg-dtbfix RELEASE=$RELEASE LINUXFAMILY=$LINUXFAMILY BOARD=$BOARD"
-    echo "DTB=${DTB_NAME} dipasang oleh customize-image.sh"
-} >> /etc/armbian-release 2>/dev/null || true
+    echo "RELEASE=$RELEASE"
+    echo "LINUXFAMILY=$LINUXFAMILY"
+    echo "BOARD=$BOARD"
+    echo "DTB=${DTB_NAME}"
+    echo "DIPASANG_OLEH=customize-image.sh userpatches"
+    echo "SUMBER=armbian_21.05_server_full.img.gz (offset 841089024)"
+    echo "MD5=7ea2e82fc5505edc2a452224ca58ccc9"
+} > /etc/yskg-dtbfix.txt 2>/dev/null || true
+echo "[yskg-dtbfix] jejak ditulis ke /etc/yskg-dtbfix.txt"
 
 echo "[yskg-dtbfix] selesai"
