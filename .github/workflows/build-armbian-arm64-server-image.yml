@@ -431,6 +431,42 @@ jobs:
           ln -sf /builder/build /home/runner/work/_actions/ophub/amlogic-s9xxx-armbian/main/build
           echo "status=success" >> ${GITHUB_OUTPUT}
 
+      - name: Apply userpatches from this repo
+        id: userpatches
+        if: ${{ steps.down.outputs.status == 'success' && !cancelled() }}
+        working-directory: /builder
+        run: |
+          # Tanpa step ini, userpatches/ di repo tidak pernah sampai ke tree build,
+          # sehingga hook customize-image.sh (mis. pemasang DTB board) tidak jalan.
+          SRC="${{ github.workspace }}/userpatches"
+          if [ -d "$SRC" ]; then
+            mkdir -p build/userpatches
+            cp -a "$SRC"/. build/userpatches/
+            echo "userpatches disalin dari repo:"
+            find build/userpatches -type f -printf '  %s\t%p\n' | sort -k2
+          else
+            echo "userpatches tidak ada di repo - dilewati"
+          fi
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Verify DTB overlay present
+        id: dtbcheck
+        if: ${{ steps.userpatches.outputs.status == 'success' && !cancelled() }}
+        working-directory: /builder
+        run: |
+          # Gagalkan lebih awal kalau DTB tidak ikut, supaya tidak menghasilkan
+          # image tanpa perbaikan yang baru ketahuan saat boot.
+          F=build/userpatches/overlay/rk3399-bozz.dtb
+          if [ -f "$F" ]; then
+            SZ=$(stat -c %s "$F"); MD5=$(md5sum "$F" | cut -d' ' -f1)
+            echo "DTB overlay: ${SZ} byte  md5=${MD5}"
+            [ "$SZ" = "75131" ] || { echo "::error::ukuran DTB tak terduga: $SZ"; exit 1; }
+            [ "$MD5" = "7ea2e82fc5505edc2a452224ca58ccc9" ] || { echo "::error::md5 DTB tak cocok: $MD5"; exit 1; }
+          else
+            echo "::warning::DTB overlay tidak ada - image akan memakai DTB default board"
+          fi
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
       - name: Compile Armbian [ ${{ matrix.release }} ]
         id: compile
         working-directory: /builder
